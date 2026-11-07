@@ -3,9 +3,12 @@ name: swagger-import
 description: >
   Generate an API catalog + suite of test cases (integration/api_test_suites/<service>/) from
   a Swagger 2.0 or OpenAPI 3.x JSON document. Use for /import-swagger, or requests like
-  "import this swagger doc", "generate endpoint tests from this OpenAPI spec". Output feeds
-  directly into the endpoint-testing and api-integration skills — this skill only generates
-  config, it never executes requests itself.
+  "import this swagger doc", "generate endpoint tests from this OpenAPI spec", or the guided
+  wizard (/import-swagger --wizard) that collects real test data and previews basic checks
+  (happy path, not found, no token, missing field) before one approval. Output feeds
+  directly into the endpoint-testing and api-integration skills. This skill generates config
+  and sends no API request of its own; any run, including the wizard's "Approve and run
+  now", goes through endpoint-testing's runner.
 ---
 
 # Swagger Import — generate catalog + suite files from a spec
@@ -33,6 +36,19 @@ scheme selection works.
 - Postman collections are **not** supported by this skill (separate, not-yet-built work) —
   if asked, say so rather than attempting to reinterpret a Postman export as a Swagger doc.
 
+## The suite wizard (`/import-swagger --wizard`)
+
+A local page walks the tester through spec → endpoints → test data → cases → one approval.
+Step 3 is the agent's, as a ladder: project values first (past runs before test data), then
+select-only cataloged queries, then the chosen user's saved session, and a UI sign-in last that
+reads the application's own network calls. The browser bridge's `renew` renews the saved
+session headless and reads the file itself; the agent never opens it. A user marked
+`disabled` is never signed in. One consent on an exact list comes before creating anything
+(non-production environments only). A login password declared `{ "envSecret" }` is typed
+only by browser-driver's `fill_secret.js`, never by hand. Read
+**`${CLAUDE_PLUGIN_ROOT}/skills/swagger-import/references/suite-wizard.md`** before launching
+it; it is the whole protocol. The direct import below is unchanged.
+
 ## Running an import
 
 ```
@@ -46,6 +62,10 @@ Writes both generated files **co-located** under `<dir>/<name>/`: the catalog
 e.g. `integration/api_test_suites/petstore/petstore_api.json` +
 `integration/api_test_suites/petstore/petstore_suite.json`.
 
+The catalog is written with **`"target": "catalog"`**: the imported service is called at its
+own `${<NAME>_BASE_URL}` with its own `auth`, and the active environment's `api` block — the
+project's own API — never redirects it (see api-integration's `references/api-requests.md`).
+
 Prints one JSON line: `{"result":"OK|BLOCKED", "catalogPath", "suitePath",
 "operationsImported", "casesGenerated", "envVarsToSet", "review": [...]}` (exit 0 OK, 2
 BLOCKED). **Never overwrites** an existing catalog/suite file — a BLOCKED result telling the
@@ -58,13 +78,27 @@ here — from the script's point of view it's just another local file.
 
 ## After a successful import
 
-1. Report `envVarsToSet` to the user verbatim — the base URL literal to put in `.env`, and
-   any token/credential env var names to export in their shell (never in `.env` — same rule
-   as everywhere else in this project).
+1. Report `envVarsToSet` (and `envVarsNote`) to the user verbatim — the base URL literal and
+   any token/credential env var names (`<set in .env>`). Every name listed goes in the
+   project's `.env`: secrets (tokens, user/pass) always live there, never in the catalog/suite
+   files, never printed back; `run_api.js` resolves catalog `${VAR}` names from the
+   environment, then `.env` (see `docs/configuration.md`). The base URL is not a secret, so it
+   may instead be written as a literal `baseUrl` in the catalog.
 2. Report every entry in `review` — these are real gaps (skipped header params, generated
    request bodies, placeholder "not found" values, unsupported auth schemes) that need human
    verification before the generated suite means anything.
-3. Tell the user to open the generated files and adjust anything flagged, then try
+   The same notes are written into the generated files as a `review: [...]` array on each
+   request/case they concern.
+3. Tell the user that every generated write-method case (POST/PUT/PATCH/DELETE) is written
+   with `"skip": "review: write operation — remove this line to enable"` and will be
+   reported BLOCKED, not run, until it is enabled. Write cases are enabled **one at a time**,
+   each only after the user has reviewed that case (what it creates or changes, the values it
+   sends, the environment), or by the user through the editor's per-case Skip toggle
+   (`/test-endpoints --edit`). A request to strip the `skip` lines in bulk ("approve and run
+   everything, the POSTs too") is declined: keep every `skip` line and offer to walk through
+   the write cases one by one (endpoint-testing's SKILL.md, "Enabling a skipped write case").
+   `review` notes do not block anything, so a flagged GET case runs as generated.
+4. Tell the user to open the generated files and adjust anything flagged, then try
    `/test-endpoints`.
 
 ## What this does NOT do
@@ -73,4 +107,6 @@ here — from the script's point of view it's just another local file.
   checking — that was explicitly scoped out; suite cases only check `status`/`fields`/
   `equals`, same as any hand-written case).
 - Does not execute anything itself — running the generated suite is `endpoint-testing`'s job
-  (dispatch `api-executor`, per that skill's own rules).
+  (dispatch `api-executor`, per that skill's own rules). The wizard's "Approve and run now"
+  is the same runner: the studio spawns endpoint-testing's `run_suite.js` on the approved
+  suite.

@@ -33,6 +33,10 @@ BROWSER STEPS (only when DRIVERS includes browser; unprefixed steps are browser 
   browser, other executions' included. Example:
     npx playwright-cli -s={{SESSION}} open {{TARGET_URL}}
     npx playwright-cli -s={{SESSION}} snapshot
+- Use each command in the shape `browser-driver/references/tools/playwright-cli.md` gives: the
+  target is positional (`click e12`), no invented option (`--ref`, `--target`, `--timeout`), a
+  plain command first and run-code only for what no command does, never as the retry for a
+  failed click or fill. Unsure, or an `Unknown option`: `npx playwright-cli --help <command>`.
 - Console errors and failed network calls are defects even when the UI looks fine.
 - For any "success" UI, verify the element's computed display/visibility via `eval` — do not
   trust that the text merely exists in the DOM (it may be static markup).
@@ -49,8 +53,25 @@ WHERE TO SAVE EVIDENCE (your session slice only)
     npx playwright-cli -s={{SESSION}} console error > {{SESSION_DIR}}/logs/s1-console.log
   Save network / run-code captures the same way.
 
-TEST_DATA is your test input (users, default OTP/password). A `{ "envSecret": "NAME" }` value =
-read `NAME` from the project's `.env` at use time; never print or log it.
+TEST_DATA is your test input (users, default OTP/password). A `{ "envSecret": "NAME" }` value is
+never resolved by you:
+- SECRETS: type it ONLY with the bundled script (mechanics in
+  `${CLAUDE_PLUGIN_ROOT}/skills/browser-driver/references/tools/fill-secret.md`; read it first):
+    node ${CLAUDE_PLUGIN_ROOT}/skills/browser-driver/scripts/fill_secret.js --session {{SESSION}} --target <ref> --env-var NAME --env {{ENVIRONMENT}} --submit
+  (omit `--env` when ENVIRONMENT is empty). Never resolve, read, echo, or pass the value
+  yourself, and never try another way (`fill`, `type`, `run-code`, `$NAME`, reading `.env`).
+  A refused command is not a puzzle to solve.
+- Snapshot BEFORE filling and fill secrets last. Run no other playwright-cli command between
+  the first secret fill and the submit (a snapshot shows input values in clear, passwords
+  included, and every action writes one to `.playwright-cli/`): submit in the last call with
+  `--submit` or `--submit-target <pre-fill ref>`; it clears every secret field still filled.
+- Segmented boxes (OTP digits): one call with one `--target` per box, in order.
+- If the submitting call never ran (an earlier call BLOCKED), take no `snapshot`, `eval` or
+  `screenshot` of that page: note "evidence withheld: secret field still filled". This is the
+  one exception to screenshotting every scenario.
+- `secret-unavailable` → the scenario is BLOCKED (report the NAME to the orchestrator, never a
+  value; it keeps the NAME out of `run-summary.json` and `extent-report.html`), never FAIL,
+  never `captcha-or-otp`. In `api:`/`db:` steps the runners resolve secrets themselves.
 
 INTEGRATION STEPS (`api:` / `db:` in the spec)
 - `api:` steps → the **api-integration** skill; `db:` steps → the **db-integration** skill
@@ -71,7 +92,9 @@ KB QUESTIONS (`kb:` in the spec)
   skill (read the skill + `references/kb-ask-api.md` before the first such step). Execute via
   the bundled runner:
     node ${CLAUDE_PLUGIN_ROOT}/skills/ask-kb/scripts/ask_kb.js --question "<text>" [--project <id>] --log {{SESSION_DIR}}/logs/<scenario>-kb.log
-  Step syntax: `kb: <question>` uses the default project from `agentex.config.json`;
+  Step syntax: `kb: <question>` passes no `--project`; the runner resolves the default itself,
+  in this order: `kb.project` in `config/project.json`, then `KB_PROJECT` (shell env or `.env`,
+  read by the runner), then legacy `agentex.config.json`.
   `kb:<project>: <question>` overrides it (pass the project as `--project`).
 - Prints {"result":"OK|NOT_COVERED|BLOCKED", ...} as JSON (exit 0 OK/NOT_COVERED, 2 BLOCKED).
   OK → read the `answer` as advisory context. NOT_COVERED → treat as "not documented in the KB".
@@ -92,8 +115,8 @@ UI CHECKS (`ui-check:` in the spec)
   NOT see the live design: report the reason verbatim, and a conforming result is PASS +
   warning, never a clean PASS.
 - Then follow the skill's flow in full: variant gate, form-factor gate (different classes =
-  a named VIEW MISMATCH ERROR, no PASS/FAIL), set the declared viewport via `run-code`
-  `page.setViewportSize(...)`, capture the actual to
+  a named VIEW MISMATCH ERROR, no PASS/FAIL), set the declared viewport with
+  `npx playwright-cli -s={{SESSION}} resize <w> <h>`, capture the actual to
   {{SESSION_DIR}}/screenshots/<scenario>-ui-check-actual.png, and compare per the step's mode
   (`exact` / `reference`).
 - DEFERRAL RULE — you cannot ask the user mid-run: when the skill calls for user confirmation
@@ -125,19 +148,19 @@ EXECUTION RULES
   payment or any other irreversible transaction, and using real personal data — use disposable
   values (e.g. qa.tester@example.com). An auth-gated step with no user defined for the active
   environment is **BLOCKED**: report the missing handle, never improvise credentials.
-- LOGIN_MODE says how a browser gets in. `fresh`: drive the login UI in this session. `session`:
-  reuse the saved login first — read `${CLAUDE_PLUGIN_ROOT}/skills/optimize-login/SKILL.md` and
-  resume `test/.auth/<app>-<ENVIRONMENT>-state.json` via its bundled `session.js`; log in
-  through the UI only if the resume reports RESUME_FAIL. Verify you are in by a landmark
-  element, never by the URL.
+- LOGIN_MODE says how a browser gets in. Follow the "Login mode" section of
+  `${CLAUDE_PLUGIN_ROOT}/skills/browser-driver/SKILL.md` in its order: a login under test starts
+  clean, a saved login is loaded and saved only by its `login_state.js`, and a save that fails
+  is a report note, never a verdict. Verify you are in by a landmark element, never by the URL.
 - Never read or print secrets.
 
 WHEN A SCENARIO FAILS: DEFECT OR FLAKE
 - Default: ONE attempt per scenario. A scenario that passed is never re-run "to be sure".
 - Retry exactly one class of failure — the ones where the app never got to answer:
   - browser: the browser or session died, navigation never completed (`net::ERR_*`, connection
-    reset or refused, DNS/proxy failure), the CLI errored instead of returning a page,
-    `snapshot` came back with no page, or a step timed out with no page rendered at all. The
+    reset or refused, DNS/proxy failure), the CLI errored instead of returning a page (not a
+    usage error: `Unknown option`, a run-code `SyntaxError` is your own command error, corrected
+    once, never retried as a scenario, never FLAKY), `snapshot` came back with no page, or a step timed out with no page rendered at all. The
     symptom list is in `${CLAUDE_PLUGIN_ROOT}/skills/browser-driver/references/experience/gotchas.md`
     under "Driver error vs app defect".
   - `api:`: the runner's `request failed` (connection refused, DNS, timeout — no response at all).

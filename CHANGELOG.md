@@ -2,26 +2,387 @@
 
 All notable changes to AgenTeX are documented here.
 
-## [Unreleased]
+## [0.28.1] — 2026-10-26
+### Fixed
+- **The agent issues browser commands in the shapes the CLI takes.** Read across 70 field
+  sessions and 92 subagents (about 6,900 browser calls), the agent passed options the CLI does
+  not have 36 times (`click --ref e12`, `fill … --timeout 5`) and wrote run-code that could not
+  run 60 more times, because the reference listed none of the action commands and forbade two
+  that exist. The browser driver's playwright-cli reference now has a table of every command a
+  run uses, with its arguments and the options that exist: the target is positional
+  (`click e12`), `type` takes no target, and there is no `--ref`, `--target` or per-command
+  `--timeout`. When the CLI answers
+  `Unknown option`, the agent reads `npx playwright-cli --help <command>` and corrects the call
+  once, instead of guessing another flag. Such an error is now the agent's own: it no longer
+  uses up the scenario's retry or turns a passing retry into FLAKY. A second one on the same
+  step leaves the step BLOCKED with the CLI's error.
+- **run-code is written as one function, and is no longer the retry for a failed click.** The
+  reference states run-code's rules with a right and a wrong example each (an
+  `async (page) => …` function, no `require`, DOM only inside `page.evaluate`, longer code from
+  a file under the session's `logs/` folder). A click or fill that fails on a rendered page is
+  reported as a defect, never redone through run-code, `force: true` or a JS click, which could
+  turn a real bug into a PASS.
+- **Two stale gotchas are gone.** `requests` exists and is now the way to capture every request
+  since the page loaded, and multi-line run-code works through `--filename`. The viewport for a
+  UI check is set with `resize` in the browser driver, ui-check and the executor. Covered by a
+  new `evals/discipline-browser-command-shapes` (3/3) and a live check on a public practice site:
+  19 browser calls, 0 `Unknown option`, 0 run-code errors, 0 retries.
+- The host-branch builder test no longer needs a git identity on the machine, so the suite
+  passes on a clean CI runner.
+
+## [0.28.0] — 2026-10-24
 ### Added
-- **`store` branch for the Claude plugin directory.** A GitHub Action
-  (`.github/workflows/store-branch.yml`) rebuilds it on every push to `main` as `main` minus
-  development-only paths (`evals/`, `*.test.js`, `.github/`, `.gitattributes`,
-  `scripts/store/`): 286 files against 542 on `main` when this landed, under the directory's
-  512-file review limit, and no root `.gitattributes`, whose eol rewriting stops directory
-  validation. `main` keeps
-  its LF pinning and evals. The sync only fast-forwards `store` and refuses to publish a tree
-  over 512 files. Covered by `scripts/store/sync_store_branch.test.js`. Thanks to @mabdel130,
-  whose PR #30 surfaced the `.gitattributes` validation failure.
+- **An architecture map on the README.** A "How it fits together" section with two mermaid
+  diagrams. The first shows what you can run: every command, the skill it runs, the skills
+  that spec steps or other skills trigger, and the subagents that take parallel work. The
+  second shows which skill relies on which. Both are generated from the plugin's own files by
+  `node scripts/dev/architecture.js --write`, and `scripts/dev/architecture.test.js` fails
+  whenever a command, skill or agent is added without regenerating, so the map cannot go
+  stale. Maintainer tooling only: `scripts/dev/` is never shipped; the README section is.
+- **Two contributor guides on writing skills.** `docs/contributing/writing-a-good-skill.md`
+  covers a `SKILL.md` that a person can read and Claude can follow: a description that says
+  what the skill does and when, hard rules first because only the first 5,000 tokens survive
+  compaction, the size limits, the writing rules, scripts for fixed mechanics, and the
+  frontmatter mistakes that silently drop a setting. `docs/contributing/writing-an-orchestrator-skill.md`
+  covers a skill or agent that hands work to subagents: what a subagent cannot do (ask the
+  user, see the conversation), where the orchestrator should live, the worker contract,
+  deferred questions, one approval before any write, batches under the subagent limit, and
+  hooks for rules that must never break.
+  The guides were first written in Arabic. In the English versions the references to the
+  maintainers' own validator commands and checklists, the `project-manager` example and the
+  `claude --agent` mentions were replaced by the rules themselves or by a generic example,
+  because those tools are not part of the shipped plugin.
+- **Browser tests can skip, and say so.** The maintainer test runner now knows a skip: an
+  `*.e2e.test.js` that exits 77 with a `SKIP: <reason>` line is counted as skipped (listed on
+  stderr and in the JSON), while 77 from any other test stays a failure. `--require-e2e` turns
+  every skip into a failure, and `scripts/dev/affected.js` no longer lists paid evals for browser
+  test files. Documented in `docs/contributing/testing.md`.
+- **A saved login now reaches the test browser.** With `login.mode: "session"` (the wizard's
+  default), a run reloads the saved login into its own browser and starts signed in, and after a
+  login through the UI it saves a fresh one. A new script, `browser-driver/scripts/login_state.js`
+  (`load` / `save`), moves the file through `@playwright/cli`'s own `state-load` / `state-save`, so
+  it needs no `playwright` library and never reads, prints or passes a cookie or storage value. It
+  checks a signed-in landmark before saving and after loading (never the URL), refuses to save when
+  `test/.auth/` is not gitignored, never saves in CI, and falls back to the UI login whenever a saved
+  login is missing, expired or unreadable. Documented in `references/tools/login-state.md`.
+- **The wizard's test-data step uses the project and the saved session before a live sign-in.**
+  `project_values.js` reads past runs first (newest first, their logs and reports do not count
+  toward the file cap), takes IDs from the URL paths of past calls by matching them against the
+  selected operations' path templates, and tags every hit with the environment, the owner and
+  the record it came from. A hit from another environment is dropped and counted. A guard of
+  256 MB stops a huge `executions/` folder instead of silently missing it.
+- **`browser_bridge.js renew`: a token from the user's saved login, headless, no password.** It
+  resumes `test/.auth/<env>-<user>-state.json` (or a hand-named file carrying the environment
+  and the user) in a browser of its own, proves the landmark, takes the token from the
+  application's own API call and hands it to the studio or the token store. The saved login is
+  read only, never written. A miss (no file, expired session, no token, no `playwright`) exits 0
+  with a reason so the next step of the ladder runs. A disabled or unknown user exits 2. Nothing
+  secret is printed.
+- **Values for one endpoint are checked to come from one record.** Values chosen from different
+  records add `summary.mismatches` and a review note on that endpoint's cases (the call may 404).
+- **A user can be marked disabled.** Put `"disabled": "<reason>"` on `users.<name>` in
+  `environments/<env>.json` and the suite wizard lists that account greyed out with the reason,
+  never preselects it, and refuses to collect test data with it (the server answers
+  `user-disabled`). The wizard now preselects the most frequent owner of the values it found in
+  your project, when that owner is a known, usable user. The Blocked results in the editor have
+  their own filter and count, and step 5 lists every write the approval makes: the catalog, the
+  suite, the collected-data store, the token file and the `.env` line, each only when it applies.
+- **A contributor guide to writing user docs.** `docs/contributing/writing-user-docs.md` gives the
+  rule for `README.md` and `docs/` pages (define a term before its first use, say what a
+  mechanism means for the user), the blind reader test that checks a page before a release, and
+  the README's question set with its answer key; the README's Tracker planning row now says that
+  if validation fails, nothing is written to the board.
+### Changed
+- **The manual `curl` fallback no longer loads `.env`.** When the API runner cannot start, the
+  fallback in `api-integration` used `set -a; . ./.env; set +a`, which put every key of `.env` in
+  the shell and broke on values with spaces or `#`. It now uses only variables already set in the
+  shell (yours, or CI's), checks that each is set without printing it, and stops with BLOCKED
+  naming a missing variable. This matches the rule that the agent never reads `.env`.
+- **The saved login file is named per user.** `test/.auth/<env>-<user>-state.json` (plus a small
+  `<env>-<user>-state.meta.json` with the page and landmark it was proven with), so a spec that
+  logs in as `buyer` and as `admin` keeps both. A file saved under the old `<app>-<env>-state.json`
+  name is not read: the first run logs in once and saves under the new name; delete the old file.
+- **The "only the library can load a saved storageState" message is gone** from `session.js` and
+  from preflight's `playwright` hint: a run's saved login does not need the library.
+- **More operations count as destructive.** The path joins the summary and operationId, any
+  method, with `-s`, `-d`, `-ed` and `-ing` forms, and `clear`, `flush` and `invalidate` join the
+  verbs. `POST .../delete`, `POST .../delete-all` and `GET /internal/reset-cache` start
+  unselected, and if one is selected anyway its cases are written with `skip`. The classic
+  `import_swagger.js` output is unchanged.
+- **The suite wizard, after its first real trial.** The user picker no longer resets while you
+  pick, starts on "pick a user", and the sign-in line names the user the run actually used. A
+  suite name that already exists stops at step 1 and names the file. Re-sending the same spec,
+  name and environment keeps your selection, values and token, a reload resumes at the furthest
+  step, and the page asks before it is closed with work in it. A typed value that does not fit
+  the field's type (`abc` for an integer) is refused with the type named, whether you or the
+  agent sent it, and a refused value shows its reason on its row and keeps your draft. A
+  collected value can be replaced by a typed one, "collect missing only" with nothing missing
+  says so, and the agent's phase line disappears once the run ended. Steps 4 and 5 split the
+  ready cases into ready and "will be BLOCKED: no token" when nothing supplies a token.
+  Arabic: counts take the right plural form, values are isolated so paths and ids do not
+  reorder the sentence, the language button names the language it switches to, and a filter
+  with no match says so. A second `server.js` start now answers with the URL of the mode you
+  asked for.
+### Fixed
+- **The test-execution skill no longer tells the agent to read `.env`.** Config comes from
+  `config/project.json` and `environments/<env>.json` only; the bundled scripts read the values
+  they need from `.env` themselves, as `fill_secret.js` and the shipped `Read(./.env*)` deny
+  rules already assumed. A never-migrated project that gets no URL from the user now stops
+  with "give the URL, or run `/update-agentex`" instead of reading `QA_TARGET_URL` from `.env`.
+  CI is unchanged: `ci_preflight.js` still reads it itself. `/execute-test` says the same.
+- **`kb:` steps describe where the default KB project comes from.** Both executors said
+  `agentex.config.json`; the runner resolves `kb.project` in `config/project.json`, then
+  `KB_PROJECT`, then the legacy file, and the executors now say so.
+- **The ask-kb guardrail names the real rule.** It referred to a `VerifyEvidence` term that
+  exists nowhere; it now says a KB answer is never a verdict and never a step's evidence.
+- **The extent-report notes match what executors and ui-check report.** Executors emit
+  PASS / FAIL / FLAKY / BLOCKED (not only PASS/FAIL), NEEDS-USER is resolved at MERGE and never
+  reaches the report, and the Warning status includes a ui-check that matched a cached (not
+  live) Figma baseline.
+- **No more `/optimize-login` command that does not exist.** The playwright-cli reference,
+  `docs/configuration.md`, `docs/ci-quality-gate.md` and preflight's missing-`playwright`
+  message now name the optimize-login skill (`login.mode: "session"`), which is what needs
+  the `playwright` library.
+- **`/init-test` launches the Setup Wizard without an undefined `${PROJECT_ROOT}`.** The
+  wizard runs from the project root with no path argument and writes into the current folder.
+  Before, a shell that exported its own `PROJECT_ROOT` sent the config there.
+- `bug-report-azure`'s `check-image.js` comment names the visual relevance check instead of a
+  step number that no longer exists.
+- **Importing a Swagger/OpenAPI spec from a URL no longer hangs on a server that never answers.**
+  The fetch now stops after 30 seconds and reports `could not fetch <url>: timed out after 30 s`.
+- **Preflight checks the Node version.** The `node` entry now carries `required` (`>=20`, the version
+  the CI templates and docs declare) and reports `ok: false` with both the found and the required
+  version when Node is older.
+- **A login-negative scenario no longer fails with a false 403 "CSRF verification failed".** The browser driver now reloads the login page after clearing cookies and localStorage and before it fills the form, because the form on screen had just lost its own cookie. After a `landmark-failed` saved login the agent goes on to the login form on the page the script already reloaded, with no reload of its own. The `discipline-saved-login-via-script` eval checks the reload.
+- **Signing in by the form right after a cleared saved login no longer fails on sites that need a CSRF cookie.** `login_state.js load` now reloads the page after clearing the dead cookies and localStorage, so the form carries a fresh token.
+- **define-flow, mobile testing, azure-integration and `/ask-kb` no longer tell the agent to read `.env`.** They now resolve config from `config/project.json` and `environments/<env>.json` only, leave secrets to the bundled scripts that read them (`appium_client.js send-keys --text-env`, the runners), and a legacy `/define-flow` with no URL stops with "give the URL, or run `/update-agentex`", as `/execute-test` does.
+- **A body parameter containing a backslash or a line break is now sent exactly as given.**
+- **The studio page treats `--spec` and `--suite` as data.** A quote in either value no longer breaks out of the page script, and `</script>`, line separators and `$` sequences are carried through unchanged.
+- The settings wizard no longer deletes a plain-text value sitting under a secret user field when you save: a field you did not touch keeps its value byte-identical and is marked as plain text on disk.
+- Editing or clearing the field on screen still replaces or unsets it, and `defaults.password` and secret user fields now share one keep-a-plain-value rule.
+
+## [0.27.0] — 2026-10-23
+### Added
+- **From a Swagger to basic API checks with real data: `/import-swagger --wizard`.** A local
+  page (Arabic by default, `--lang=en`) takes a spec, a suite name and an environment you pick,
+  lists every operation (destructive writes unselected, other writes arriving skipped, public
+  ones without a 401 case), then collects real test data.
+  - **Project first:** test data, past executions, and read-only cataloged DB queries.
+  - **Then the application's UI:** Claude signs in as a user you pick and reads IDs, bodies
+    and the session token from the app's own network calls. The password and the token never
+    pass through the agent, a command line, the page or a log. A password declared
+    `{ "envSecret" }` is typed by browser-driver's `fill_secret.js`, as in a test run. A
+    captcha or OTP is handed to you.
+  - **Creating missing data** needs one consent on the exact list, and only on an environment
+    marked `"nonProduction": true`. The server enforces this and names the field when it
+    refuses.
+  - **Cases:** a preview of four checks per endpoint (happy path, not found, no token, missing
+    required field). One approval writes the catalog and the suite, never over an existing
+    file. The captured token goes only to `test/.auth/api-tokens/` (0600); the collected values
+    to `.agentex/cache/api-data/` (both gitignored).
+- **A local suite editor: `/test-endpoints --edit`.** Every suite under
+  `integration/api_test_suites/`, with a source badge per value (UI · Project · Auto ·
+  Placeholder · Manual), Needs review / Failing / Skipped filters and an edit drawer.
+  - Save never overwrites a change made on disk after the page loaded the file: it refuses
+    and lists your unsaved edits. Unknown fields, review notes and case order are kept.
+  - Run all / Run this case go through the same runner as `/test-endpoints`, with the same
+    evidence in `executions/`.
+  - The page answers only `127.0.0.1:<port>` / `localhost:<port>` (no DNS rebinding).
+- **Generated write cases are enabled one at a time.** Each POST/PUT/PATCH/DELETE case stays
+  skipped until you review it (what it creates or changes, the values it sends, the
+  environment) or flip its Skip toggle in the editor; a request to strip the skip lines in
+  bulk is declined.
+- **Runner gaps closed (backward compatible).**
+  - `run_api.js`: `--no-auth`, `--expect-contains`, `--omit`, typed `$param` body nodes,
+    `auth.tokenStore` (BLOCKED `token-missing` / `token-expired`, never a 401 FAIL), an `ms`
+    timing, and every credential value it sent redacted from logs and output.
+  - `run_suite.js`: case `auth: "none"`, `omit`, `expect.contains` and `sources` (a value still
+    a placeholder is BLOCKED "needs a real value" and never sent). Also `--suite <file>` and
+    `--case <n>` subset runs, and a `suite-result.json` in every run folder.
+  - Existing suites run unchanged; a legacy-suite snapshot test guards it.
+### Changed
+- **A CI BLOCKED that left no verdict now says why.** Before, the verdict said only
+  `no-verdict`, and the gate spent up to 4 sessions and 90 s of pauses on it. Now
+  `ci_gate.js` reads the session's own result and names the cause on the reason, plus one
+  stderr line with the fix. A runner with no Claude auth gives `session-error` with
+  `cause: "not-authenticated"`; set `ANTHROPIC_API_KEY` on the gate step. A tool the CI
+  settings denied gives `no-verdict` with `cause: "tool-denied"` and `tools` (names only, never
+  the tool's input); allow it in `ci-settings.json`. Neither is retried (`retryable: false`),
+  so the run stops after one session. Anything else stays `no-verdict` with
+  `cause: "unknown"` and is retried as before. A verdict file the session did write always
+  wins. The new fields are optional and additive to verdict contract v1 (no `schemaVersion`
+  bump); `docs/ci-quality-gate.md` documents them and the no-retry cases.
+- **Maintainer tooling: changelog fragments and file-level eval selection.** Nothing here
+  reaches a consumer.
+  - A feature now adds `changelog.d/<slug>.md` instead of editing `CHANGELOG.md`, so merges
+    into a moving `main` stop conflicting there. `node scripts/dev/changelog.js --check`
+    validates the fragments; `--assemble <X.Y.Z>` folds them (and any `[Unreleased]` section)
+    into the release section at release time. `changelog.d` is excluded from every host build
+    and inert in the release-gate plan.
+  - `scripts/dev/affected.js`: an `evals/coverage.json` pattern that names a folder no longer
+    matches a changed script (a `.js` outside `*.test.js`), directly or through a file that
+    requires it, so a script edit in a skill stops selecting every eval of that skill. A
+    pattern naming a file still matches it; prompts, references and data keep matching folder
+    patterns.
+### Fixed
+- **A failed login that re-renders the password no longer leaks it to a snapshot.** After
+  `--submit`, `fill_secret.js` now clears every input and textarea on the page the browser
+  ends up on whose value equals the secret, not only the fields it filled itself, and counts
+  them in `scrubbed`. The suite wizard's plain-string login (`browser_bridge.js fill-secret`)
+  does the same. The suite wizard's login step says a snapshot is safe only after this scrub.
+- **A failure note in the suite wizard survives a late `ended`.** A run marked `failed` stays
+  failed; the wizard text now says to post `failed` on failure and `ended` only on success.
+- **The editor's case drawer no longer shows the word `null`** under the message check and
+  after "Last run".
+- **Studio runs are named like every other run.** `executions/execu_<local time>` — the same
+  `YYYY-MM-DD_HH-MM-SS` as `/test-endpoints`, in local time; before, they were
+  named in UTC and sorted out of order next to other runs. A test pins the two formats together.
+- **The Save-conflict banner hides after Reload.**
+- **`result.md` of a run started by "Approve and run" says "run from the suite wizard"**
+  instead of "run from the editor".
+
+## [0.26.0] — 2026-10-22
+### Added
+- **A password-gated login can pass in CI.** Until now, every way to type an
+  `{ "envSecret": "NAME" }` value into a browser field leaked it into a command line or tool
+  output, so a headless run refused them all and ended BLOCKED `captcha-or-otp`. The new
+  `skills/browser-driver/scripts/fill_secret.js` reads the value itself (process env, then
+  `.env`) and types it into the run's playwright-cli session. The value goes through a 0600
+  temp file outside the project that is removed in `finally`. The child's output is never
+  relayed, because playwright-cli echoes the code it ran. Only names declared as `envSecret` in
+  the active environment or `config/project.json` are fillable. Segmented OTP boxes take one
+  call, one `--target` per box. `--submit` / `--submit-target` submit in the same call and then
+  clear every field the script filled on that page: a playwright-cli snapshot shows input
+  values in clear text, password fields included, and every action writes one to
+  `.playwright-cli/`. One JSON line, exit `0` / `2`. It never issues a verdict. The rule lines
+  in browser-driver, qa-executor, test-execution and define-flow make it the only way to type a
+  secret, in every mode. `docs/ci-quality-gate.md` documents the path end to end. Covered by
+  `fill_secret.test.js` (32, including a sentinel sweep of argv, stdout/stderr and every file
+  left behind, and a pin that the shipped CI settings allow the call) and the new
+  `discipline-secret-fill-via-script` eval.
+- **`write_verdict.js` run reason `secret-unavailable`.** A missing or empty variable at fill
+  time is a named BLOCKED (exit 2), no longer reported as `captcha-or-otp`. This is additive to
+  verdict contract v1. `captcha-or-otp` now means a real captcha or an OTP nobody can supply.
+
+### Changed
+- `import_swagger.js` now runs on the shared `swagger_model.js`. Its output is byte-identical
+  (golden tests over fifteen specs).
+- **CI preflight reports where each secret comes from.** `checks.secrets.sources` gives
+  `process-env` or `dotenv` per name. Names found only in `.env` get one stderr note: that works
+  for a local trial, but a CI runner has no `.env`. The note never gates. An empty or
+  whitespace-only value now counts as missing (`preflight-secrets`, listed under `empty`).
+  Before, it passed preflight.
+- **`settings.example.json` no longer warns at startup.** The `Write`, `MultiEdit` and
+  `NotebookEdit` path rules are gone: Claude Code consults only `Edit(path)` rules for file edits,
+  and `Edit(./src/**)` already covers every file-editing tool, so protection is unchanged.
+
+### Fixed
+- **CI preflight no longer fails on a fresh project that does not use Figma.** The scaffold's
+  `figma` block (empty `fileKey`, token `{ "envSecret": "FIGMA_TOKEN" }`) counted as a required
+  secret, so every new project's first CI run ended `preflight-secrets`. With no `fileKey`,
+  Figma is not configured and its token is not required.
+- The CI gate closes the headless session's stdin, so each attempt no longer waits 3 seconds
+  for piped input.
+
+## [0.25.0] — 2026-10-22
+### Added
+- **A consumer project can go into git without leaking a secret.** New `scripts/secret_scan.js`
+  checks a consumer project for its *own* secret values — every `.env` key plus every
+  `{ "envSecret": "NAME" }` the config references — in the files git tracks (`--tracked`) or in
+  exactly the content staged for the next commit (`--staged`). It also catches the structural
+  leaks nothing noticed before: a `.env` that is tracked or staged, and a credential pasted into a
+  git remote URL (reported by remote name only, never the URL). One JSON line, exit `0` / `1` /
+  `2`, and it never prints a value — not in the result, not in a finding. A plain-string password
+  in `environments/*.json` or a pasted value in an `integration/*.json` `*Env` field is a warning
+  with the `{ "envSecret": "NAME" }` fix, never a block (the config contract still allows throwaway
+  test credentials). Short values — a 6-digit test password — are matched only as a whole token
+  right after a password label (English or Arabic, through direction marks, NBSP, tatweel and
+  markdown) or under a password key in JSON, never as a raw substring: on the pilot project a raw
+  substring match gave 65 false hits while 11 real copies went unreported. Non-secret keys that live
+  in `.env` by convention — the legacy config keys, the ADO fallbacks, `JIRA_EMAIL`, and the
+  `<NAME>_BASE_URL` that `/import-swagger` tells you to put there — are named as not value-checked
+  instead of refusing commits. No `.env` on the machine → a loud `value check skipped`, not a
+  block.
+  Binary and over-1 MiB files are skipped and counted. Covered by `secret_scan.test.js` (39),
+  `secret_scan_core.test.js` (29) and `git_plumbing.test.js` (13), each with a sentinel test that
+  no secret value reaches stdout or stderr.
+- **An opt-in pre-commit hook runs the scan on every commit.** `/init-test` offers it as a new
+  step 6 and installs it only on an explicit yes; `/update-agentex` offers it while it is absent
+  and installs it only under `--install-pre-commit-hook` — handled before the "already up to date"
+  fast path, so a stamped project gets the offer too. The hook refuses a commit only for a real
+  leak (`LEAK` → nothing committed); warnings print and the commit proceeds. It is static POSIX
+  `sh`, finds the newest installed plugin version at commit time (so it survives plugin updates),
+  and fails *open* loudly — plugin gone, Node missing, scan error → the commit proceeds with an
+  `UNSCANNED` line, never a silent pass. An existing hook is never overwritten, a repo-local
+  `core.hooksPath` is honoured, and a machine-wide one is refused with a pointer to the docs.
+  Turning it off is deleting one file. Covered by `precommit_hook.test.js` (27), including real
+  commits in throwaway repos.
+- **"Putting your project in git" docs page.** `docs/putting-your-project-in-git.md`: what to
+  commit and what stays local (a table including the new scratch folder), why `executions/` is not
+  ignored by default, setting a remote with no token in the URL, the scan and the hook, every
+  finding and its fix — and that a secret already in history or on a remote must be rotated.
+  Linked from `docs/getting-started.md` and the docs index.
+### Changed
+- **Agents stop littering the project with scratch files.** Test-design and task-estimation told
+  the agent to write intermediate files to an undefined `$TMP`, so agents improvised — the pilot
+  project removed 80+ `.tmp-*` / `.scratch_*` files from its root in one cleanup commit. Both skills
+  and their scripts now write only to `.agentex/scratch/`, which the scaffold gitignores — one
+  narrow line, never `.agentex/` or `.claude/` wholesale (`version.json`, `test-template.md` and
+  `qa-watchlist/` stay committed). `/update-agentex` appends the line to existing projects; existing
+  lines are never touched.
+- **The wizard's shared test password is a secret.** Its hint used to say "written as-is … (not a
+  real secret)", contradicting the envSecret policy. A typed value now goes to `.env` under
+  `DEFAULT_PASSWORD` and the environment file refers to it as `{ "envSecret": "DEFAULT_PASSWORD" }`;
+  left blank, no `defaults.password` key is written (it used to write the `Test@1234`
+  placeholder). The hint is fixed in `scripts/wizard/engine.js`, `ui.html` and
+  `templates/config/project.json`; no template ships a password value. Existing projects are never
+  rewritten: a plain on-disk password is shown, kept byte-identical on save, and flagged with how to
+  move it to `.env` — a frozen legacy field definition closes the path where `m11`'s backfill
+  would have deleted it on save. `docs/configuration.md` describes `defaults.password` as a secret
+  field.
+
+## [0.24.0] — 2026-10-19
+### Added
+- **One plugin branch per host, generated from `main`.** `main` stays the only source,
+  written the Claude Code way; `.github/workflows/hosts.yml` rebuilds a branch per host on
+  every push to `main`, driven by `hosts/<host>/host.json` and `scripts/hosts/build_host.js`:
+  - **`store`** (Claude plugin directory): `main` minus development-only paths (`evals/`,
+    `*.test.js`, test golden fixtures, `.github/`, `.gitattributes`, `hosts/`,
+    `scripts/hosts/`), which keeps it under the directory's 512-file review limit and free of
+    a root `.gitattributes`, whose eol rewriting stops directory validation. `main` keeps its
+    LF pinning and evals.
+  - **`copilot`** (GitHub Copilot CLI and VS Code), **`devin`** (Devin, formerly Windsurf) and
+    **`codex`** (OpenAI Codex): converted from the Claude layout — `${CLAUDE_PLUGIN_ROOT}`
+    becomes an `<agentex-root>` placeholder explained under each skill's frontmatter, commands
+    become user-invoked skills where the host has no plugin commands (with `/command` mentions
+    rewritten to the host's syntax), agent definitions move to `references/agents/` on Codex,
+    and `AskUserQuestion` is renamed to each host's ask tool. The `copilot` and `codex`
+    branches are their own marketplaces, so testers install them straight from this repo
+    (`docs/contributing/host-branches.md`). Not yet certified on the live hosts or submitted
+    to their stores.
+
+  Every build runs the host's guards first (skill manifests and the 1024-character
+  description limit, leftover Claude-only text, banned paths, file limits, the manifest) and
+  publishes nothing when one fails. Builds only fast-forward their branch and make no commit
+  when nothing changed; they refuse a branch head the builder didn't make (a hand edit is
+  never overwritten) and a source older than the last build's (no rollback from a re-run).
+  The first build of a new plugin version tags `<host>-v<version>` for stores that pin a tag
+  or sha. How to write `main` so every host builds: `docs/contributing/host-branches.md`.
+  Covered by `scripts/hosts/{transforms,guards,build_host}.test.js`, including a check that
+  every host builds cleanly from the repo's HEAD. Thanks to @mabdel130, whose PR #30 surfaced
+  the `.gitattributes` validation failure.
 - **`endpoint-testing` skill** — standalone API test run over cataloged endpoints ("api-tests"),
   independent of any browser test spec (the "Standalone API tests" row flips from planned to
   available). New `integration/api_test_suites/**/*_suite.json` case files reference a sibling
   `*_api.json` catalog's entries by name and supply the concrete params/expected result a
   standalone run needs — one entry can have multiple cases (happy path, not-found, …). Every
-  case in every suite file runs every time — there's no scope/tag selection.
+  enabled case in every suite file runs every time — there's no scope/tag selection. A case
+  carrying `"skip": "<reason>"` is reported BLOCKED with that reason and never sent, and a case
+  with no `expect` is BLOCKED rather than passed on whatever status comes back.
 - `run_suite.js` — deterministic runner that shells out to `api-integration`'s `run_api.js`
   per case (never duplicates its catalog/auth/assertion logic), aggregating one
-  PASS/FAIL/BLOCKED summary.
+  PASS/FAIL/BLOCKED summary. `--env <name>` is passed to every call, and per-case logs are
+  named `<suite>__<n>-<case>.log` so two cases never share one.
 - `agents/api-executor.md` — subagent (sibling to `qa-executor`) that runs the full set of
   api-tests in one call and returns a consolidated defect report, keeping per-case logs out of
   the orchestrator's context.
@@ -32,46 +393,84 @@ All notable changes to AgenTeX are documented here.
   `.../<service>_suite.json`, from a Swagger 2.0 / OpenAPI 3.x JSON document (local file,
   URL, or a SwaggerHub-hosted spec via the Swagger MCP connector), via `import_swagger.js`
   and the `/import-swagger <source> [--name <service>]` command. Picks one supported auth
-  scheme per catalog file (`bearer` > `apiKey` header > `basic`), flags unsupported schemes
-  (oauth2/openIdConnect) and every generated best-effort value (param examples, request
-  bodies, "not found" placeholders) for manual review instead of guessing silently. Never
-  overwrites an existing catalog/suite file. JSON-only input (no YAML parser); Postman import
+  scheme per catalog file (`bearer` > `apiKey` header > `basic`, whatever the declaration
+  order), flags unsupported schemes (oauth2/openIdConnect) and every generated best-effort
+  value (inferred params, request bodies, an invented `200`, dropped non-JSON bodies, "not
+  found" placeholders) for manual review — in a `review` array on each generated request and
+  case, not only on stdout. Generated write cases (anything but GET/HEAD) are written disabled
+  with a `skip` line, so an import never sends a DELETE/PUT/POST/PATCH until a person enables
+  it. Env-var names carry the service prefix (`PET_STORE_BASE_URL`, …; a service named `api`
+  gets `API_SERVICE_`), never the project's own `API_`, and secrets go in the project's `.env`.
+  Duplicate operation names get `-2`, `-3`; a spec URL that answers non-2xx is BLOCKED.
+  Internal `$ref`s resolve recursively (external and circular ones are flagged), request
+  bodies are built as real nested objects, a relative `servers[].url` resolves against the
+  fetched origin, enum params take their first value and date formats an ISO placeholder —
+  verified against the live Petstore v2 and v3 demos. Never overwrites an existing
+  catalog/suite file. JSON-only input (no YAML parser); Postman import
   and response-schema/contract validation are explicitly out of scope.
 - `run_api.js`: catalog lookup is recursive under `--catalog` (default `./integration`), so
   both hand-written flat catalogs and `swagger-import`'s nested
   `integration/api_test_suites/<service>/` catalogs resolve by their internal `"name"`
-  regardless of location. Also two small additive extensions needed for imported entries to
-  work against real specs — `auth.type: "apiKey"` (custom header auth) and a query-string
-  fallback for any declared param not consumed by a `{name}` path placeholder (previously
-  silently dropped). Backward compatible; existing catalogs are unaffected.
-
+  regardless of location; two catalogs sharing one `"name"` are BLOCKED with both files
+  listed, and `node_modules/` and dot-directories are skipped. Two additive extensions for
+  imported entries: `auth.type: "apiKey"` (custom header auth) and an optional `query: [...]`
+  list naming the params sent as query string. A declared param used nowhere in the path or
+  body falls back to the query string (previously silently dropped); a param used in the body
+  stays out of the URL. The active environment's `api` block (base URL and token) now applies,
+  for a catalog without a `target`, only when its `baseUrl` is absent or exactly
+  `${API_BASE_URL}` — a catalog that declares its own host keeps its own host and auth, so an
+  imported service never receives the project's token. A `baseUrl` such as
+  `${API_BASE_URL}/v2` now resolves itself instead of being replaced by the environment's base
+  URL, which used to drop the `/v2`.
 - **Mobile testing** — a new `mobile-testing` skill automates native Android/iOS apps through
   a real [Appium](https://appium.io/docs/en/latest/) session, mirroring the existing
-  browser-testing flow: sequential (human-in-the-loop) or parallel (autonomous, one
+  test-execution flow: sequential (human-in-the-loop) or parallel (autonomous, one
   `mobile-qa-executor` subagent per spec file, per device/emulator).
 - `/execute-mobile-test` command, `agents/mobile-qa-executor.md` subagent, and bundled starter
-  specs in `test/mobile-suite1/`.
+  specs in `test/mobile-suite1/`. The specs declare `Drivers: mobile`; `/execute-test` and the
+  CI gate BLOCK a mobile spec ("mobile specs run via /execute-mobile-test") instead of running
+  it in a browser. Every session sets `appium:noReset: true`, so a run never wipes app data; a
+  reset needs explicit approval.
 - Two ways to drive an Appium session, documented in
   `skills/mobile-testing/references/`: raw W3C WebDriver REST via `curl`
   (`appium-server-cli.md`, no extra dependency) or the bundled `webdriverio`-based
   `scripts/appium_client.js` wrapper (`appium-client-wrapper.md`, requires the project's own
-  `webdriverio` devDependency).
+  `webdriverio` devDependency). Typed secrets come from `send-keys --text-env NAME`
+  (environment, then `.env`) and never reach stdout; an unreachable server or dead session is
+  BLOCKED as infrastructure, not FAIL.
 - `skills/mobile-testing/scripts/preflight.js` / `init_run.js` / `merge_run.js` — the same
-  deterministic orchestration pattern as `browser-testing`'s scripts, adapted for
+  deterministic orchestration pattern as `test-execution`'s scripts, adapted for
   `mobile-sessions/`.
 - Optional `mobile` block in `environments/<env>.json` (`platformName`, `automationName`,
   `app`/`appPackage`+`appActivity`/`bundleId`, `deviceName`, `platformVersion`, `udid`) —
-  additive, browser-only projects are unaffected. Documented in `docs/configuration.md`.
+  opt-in (the scaffolded `qc.json` carries none), browser-only projects are unaffected.
+  Documented in `docs/configuration.md`.
 - `docs/mobile-testing.md` and `docs/contributing/adding-a-capability.md` — the latter is a new
   contributing guide for additions bigger than one skill (its own subagent/command/docs page),
   using this mobile-testing addition as the worked example.
-- `settings.example.json` — `appium` and read-only `adb`/`xcrun simctl` commands pre-approved;
-  destructive device actions (`adb uninstall`, `adb reboot`, `xcrun simctl erase`, …) prompt
-  instead, matching the existing `az` destructive-action pattern. The same boundary is stated
+- `settings.example.json` — `appium` version/server/driver-list and read-only `adb`/`xcrun
+  simctl` commands pre-approved; `appium driver|plugin install`, `xcrun simctl spawn`,
+  `adb logcat -c` and destructive device actions (`adb uninstall`, `adb reboot`,
+  `xcrun simctl erase`, …) prompt instead, matching the existing `az` destructive-action pattern. The same boundary is stated
   explicitly in `skills/mobile-testing/SKILL.md` and `agents/mobile-qa-executor.md` — a run's
   device footprint never goes beyond installing/launching/exercising/closing the app under test.
 
+- **Configurable task estimation.** `config/estimation.json` (committed, user-owned) defines the
+  `[Testing]` tasks (names, count, order, min/max hours, enabled) and the rating factors. The
+  first estimation run proposes it from the Original Estimates of the team's last 2 closed
+  sprints (ADO and Jira), asks about abnormal values on the same approval screen, and writes it
+  only on approval and never over an existing file. With no usable history, labelled starter
+  defaults (about 3–5 h per story). Hours = a 0–4 factor rating score placed within each task's
+  range. An invalid file stops the run naming the problem. Covered by
+  `scripts/lib/estimation_config.test.js`, `skills/task-estimation/scripts/estimation/*.test.js`,
+  `create-tasks.estimation.test.js`, adapter, conformance and upgrade-path tests, and four new
+  `discipline-estimation-*` evals.
+- `/estimate-sprint` command.
+
 ### Changed
+- **`test-design`'s description is under 1024 characters** (it was 1122). The Agent Skills
+  limit that Copilot, Devin and Codex enforce; the mechanics clause and a bullet that repeated
+  the opening sentence went, the trigger phrases stayed.
 - `docs/getting-started.md` and `docs/contributing/architecture.md` updated to reflect the new
   mobile-testing capability (no longer describe `qa-executor` as the only subagent).
 - **Bug screenshots are attached annotated.** `bug-report-azure` now uploads, ahead of each
@@ -82,7 +481,8 @@ All notable changes to AgenTeX are documented here.
   Both files, and the text the copy adds, are what the one approval lists and uploads, on
   Azure DevOps and Jira alike; `create-bug.js` is unchanged. Without playwright-cli, or when a box is still off after
   two fixes, the raw screenshot is attached and the consolidated screen says why —
-  annotation never blocks a filing or adds a question. Covered by
+  annotation never blocks a filing or adds a question. A box that overhangs the image edge is
+  clipped to its visible part, and one wholly outside is refused. Covered by
   `skills/bug-report-azure/scripts/annotate-image.test.js`.
 - **The extent report opens with the run's verdict.** On a `schemaVersion: 2` run summary,
   `make_html_report.js` now renders a PASSED / FAILED / BLOCKED banner computed by the CI
@@ -96,7 +496,21 @@ All notable changes to AgenTeX are documented here.
   cards, and print styles switch to a light palette with every card expanded. The legacy
   (no `schemaVersion`) output is byte-identical, and the release-gate name→pill window is
   untouched. Covered by six new cases in `make_html_report.test.js`.
+- `/estimate-story` and the task-estimation skill use the file; the fixed five-task template and
+  the Simple/Medium/Heavy hours table are gone.
+- **A hand-written API catalog on its own base-URL variable no longer follows the environment.**
+  Through 0.23.0 the active environment's `api` block replaced every catalog's base URL and
+  auth; a catalog with no `target` whose `baseUrl` uses a variable other than `${API_BASE_URL}`
+  now calls that URL with its own `auth`. Add `"target": "environment"` to keep the old routing.
+
 ### Fixed
+- **An empty secret in `.env` no longer reads as the next line.** The shared `.env` reader
+  (`scripts/lib/project_config.js`) and `ask-kb`'s copy matched `KEY=` across a line break,
+  so an empty `API_TOKEN=` returned the following line — often another secret — and a step
+  that should have been BLOCKED sent it as auth. `.env` is now parsed one line at a time
+  (`export` prefixes, quotes and CRLF line endings handled), and an empty value reads as
+  unset. The wizard updates `export KEY=` and indented lines in place, and the release
+  gate's wizard check uses the same parser.
 - **`api:` steps read catalog secrets from `.env`.** `run_api.js` resolved a catalog's own
   env-var names (`${API_BASE_URL}` in `baseUrl`, `auth.tokenEnv`, `auth.userEnv` /
   `passEnv`) from the shell environment only, so a token kept in `.env`, the documented home
@@ -105,34 +519,87 @@ All notable changes to AgenTeX are documented here.
   The curl fallback in `references/api-requests.md` loads `.env` the same way. Covered by
   three new cases in `run_api.test.js`. Thanks to @MarwahZain, whose PR #9 flagged the
   inconsistent `API_TOKEN` handling (closed with credit, not merged).
+- **An imported API catalog calls its own service.** `run_api.js` let the active environment's
+  `api` block win over every catalog, its token replacing any catalog auth as
+  `Authorization: Bearer` — right for the project's own hand-written catalogs, wrong for one
+  `swagger-import` generated for a different service, whose `${<NAME>_BASE_URL}` and
+  `apiKey`/`basic`/`bearer` auth were silently replaced. Found twice: by the 2026-10-10
+  post-merge review of the API-suites contribution, and live in the release gate, where a
+  wizard-configured project's `/import-swagger` petstore → `/test-endpoints` run went 0/3, every
+  case a 404 from the project's API host, and a plain `/init-test` project sent the same calls
+  to the sample environment's host after demanding its `API_TOKEN`. One rule now decides, an
+  explicit `target` first: `"catalog"` uses the catalog's own `baseUrl` refs (environment, then
+  `.env`) and its own `auth`, and the environment's `api` block is ignored for it — base URL and
+  token both; `"environment"` uses the environment's `api` block whatever the `baseUrl` says —
+  the override for a hand-written catalog whose base URL is another variable but should still
+  follow `--env`; with no `target`, the environment applies only to a `baseUrl` that is
+  absent/empty or exactly `${API_BASE_URL}`, and any other keeps its own base URL and auth. Any
+  other `target` value is `BLOCKED` (exit 2) naming the catalog, the field and the allowed
+  values, before a single request; an unknown `--env`, or an unset ref in a catalog's own base
+  URL, stays `BLOCKED` with no fallback to the environment's host. `import_swagger.js` writes
+  `"target": "catalog"` into every catalog it generates, and the gate's three cases pass 3/3
+  with the environment untouched. `run_suite.js` also called `run_api.js` without `--env`, so a
+  suite could never pick a named environment; `/test-endpoints --env <name>` now reaches every
+  case through `api-executor`'s new optional `ENVIRONMENT` input (empty → no flag, the default
+  environment as before). And `swagger-import` told users to export tokens "in your shell,
+  never in `.env`", the opposite of the project's rule and of the root `.env.example` — its
+  `SKILL.md`, `swagger-mapping.md`, `/import-swagger`, endpoint-testing's `suite-format.md` and
+  the `envVarsToSet` placeholders (`<set in .env>`) now keep every value in `.env`. Covered by
+  fifteen target cases in `run_api.test.js` (the four-way rule matrix, an unknown `--env` in
+  every cell, catalog `apiKey`/`bearer`/`basic` auth, unset refs, an unknown `target`), two in
+  `import_swagger.test.js` and four `--env` cases in `run_suite.test.js`.
+- **The Azure DevOps PAT is scrubbed from every tracker error.** A provider, proxy or network
+  layer that echoes request material back could carry the token into a `TrackerError`, and
+  from there into a script's JSON output. The ADO adapter now replaces it in every form it
+  travels in (the `Basic` header, its base64 payload, the raw value, URL-encoded and
+  JSON-escaped) in the error's URL, server message and body, nested values of a JSON error
+  body included. The fetch-failure, unreadable-body (now wrapped instead of surfacing a raw
+  stream error) and non-2xx paths are covered; successful responses are returned untouched.
+  Covered by six new cases in `ado.test.js`.
+- **ADO requests are sent only for canonical work-item IDs.** Every adapter call that sends a
+  request refuses, with exit 2 and before anything is sent, a work-item, plan, suite, run,
+  test-case or relation-target id that is not a plain positive decimal (no leading zero,
+  whitespace, `#`, sign, exponent or non-ASCII digits), so an id cannot carry a path or query
+  into a URL. Dry runs check no id: `testplan.js fail --bug NEW` (or `<bugId>`, `new-bug-id`),
+  which the bug flow plans before the Bug exists, works exactly as before. An `azure.org` /
+  `AZURE_URL` carrying credentials, a query string or a fragment is refused at config time,
+  without echoing the value. Covered in `ado.test.js` and `testplan.test.js`.
+- **Bug attachments upload exactly the bytes that passed the structural check.**
+  `create-bug.js` read each screenshot twice, once to check it and once to upload it, so a
+  file changed on disk in between reached the board unchecked. The check's buffer is now
+  handed to `uploadAttachment` (new `opts.bytes`, ADO and Jira) and sent verbatim. This binds
+  the execute run's own check; a screenshot replaced between the approved dry run and
+  `--execute` is still re-checked structurally, not re-reviewed. Covered in
+  `create-bug.test.js`, `ado.test.js` and `jira.test.js`.
+- **The codex branch builds with the listing icon in place.** `.claude-plugin/icon.png` (#31)
+  landed in a folder the codex host forbids (its manifest moves to `.codex-plugin/`), so every
+  codex build failed its `forbiddenPaths` guard and `build_host.test.js` went red on `main`.
+  `hosts/codex/host.json` now excludes the icon; the other hosts keep it.
+
 ### Credits
+- The multi-host direction, and the host knowledge behind the Copilot and Codex branches
+  (entry points, native subagent coordination, a certification checklist), came from
+  community **PR #22** and its split into **#27/#28/#29** by @MohamedAbdella. The branches are
+  generated from `main` instead of carrying host files on `main`, so no code was lifted; the
+  ideas were.
 - The extent report's verdict banner, pass rate, "Issues only" filter, per-card step counts
   and print styles were harvested from community **PR #6** by @YoussefAbdellah2023. Its
   parallel v2/v3 generator files were not adopted: they forked the pre-`schemaVersion: 2`
   renderer and lacked flaky / warning / view-mismatch statuses, timing, evidence and defects,
   so the ideas were rebuilt inside `make_html_report.js` instead. Closed with credit, not
   merged.
-- `import_swagger.js`: found while testing against a live public OpenAPI spec — relative
-  `servers[].url` values (e.g. `"/api/v3"`, common in real specs) were used literally instead
-  of being resolved against the spec's own host; now resolved when the spec was fetched from
-  a URL (flagged for manual review when imported from a local file, since there's no origin
-  to resolve against). Also: enum-typed params now use the first enum value instead of a
-  generic placeholder (e.g. a `status` param picks its first valid value), and array-typed
-  params are explicitly flagged in `review` — a single representative value is generated, not
-  full OpenAPI array-serialization (`style`/`explode`), which remains a known limitation.
-- `import_swagger.js`: found running the generated Petstore suite against a live server —
-  internal `$ref` pointers (`components.schemas` / `definitions`) were never resolved, so any
-  field defined via `$ref` (in practice, almost every non-trivial field in a real spec)
-  silently degraded to the generic `'example'` placeholder, and every request body — always a
-  `$ref` to a reusable schema in practice — became the literal string `"example"` instead of
-  an object. The server rejected these outright (`400 unable to convert input to <Model>`).
-  Now: `$ref`s resolve recursively (including nested and chained refs), external refs and
-  circular chains are left unresolved/flagged instead of guessed, request bodies build real
-  nested arrays/objects instead of flattening them to a scalar, and `date`/`date-time` string
-  formats get a real ISO-8601 placeholder instead of `'example'`. Verified against the live
-  Petstore demo: all 6 previously-400ing write endpoints now pass body validation (any
-  remaining failures are the shared public demo server's own instability, confirmed
-  independently on read-only endpoints too).
+- Standalone API suites and Swagger/OpenAPI import were contributed by @MarwahZain in
+  community **PR #10** (merged via #25), mobile testing through Appium by @mabdel130 in
+  **PR #15** (merged via #24), and annotated bug screenshots by @MahmoudElSharkawy in
+  **PR #20**. Post-merge review hardened all three before release; the changes are folded
+  into the entries above.
+- The ADO error-path PAT scrub, the work-item ID and `azure.org` checks and the attachment
+  byte custody were harvested from community **PR #27** by @MohamedAbdella and rebuilt in
+  house style. The ID check was narrowed to requests actually sent, because the PR's version
+  also refused the dry-run stand-ins the bug flow plans with. Its bug-write receipts and
+  ledger, approved-plan digest, update lock and migrate preflight, strict version stamps,
+  `scaffold.js`/`init.js` changes and host-neutral execution-result contract were not
+  adopted (regressions found in review, or no caller yet). Closed with credit, not merged.
 
 ## [0.23.0] — 2026-10-09
 ### Added
