@@ -1,0 +1,703 @@
+'use strict';
+// Azure DevOps REST adapter — the provider side of scripts/lib/tracker/.
+//
+// Transport: Node's built-in fetch, direct against the ADO REST API. There is NO
+// az CLI here and nothing in this lib can spawn a process (a test asserts it):
+// HTTP bodies have no shell, so bug text of any size and shape travels without
+// quoting tricks, temp-file args, or the Windows 8191-char command-line limit.
+//
+// SECRETS (invariant 5): the PAT resolves lazily via the repo's
+// project_config.readEnvVar (process.env, then a KEY=value line in <cwd>/.env),
+// in the order AZURE_PAT -> AZURE_DEVOPS_EXT_PAT -> AZURE_DEVOPS_PAT (the
+// scaffolded name first; pattern credit: plugin PR #16's resolvePat, order
+// inverted). It enters memory once and reaches ONLY the Authorization header —
+// never a return value, an error, a log line, argv, or a dry-run descriptor
+// (those print `authorization: <Basic ***, not printed>`, PR #16's wording).
+// Belt and braces on the error path: a provider or proxy can echo request
+// material back, so every TrackerError diagnostic is scrubbed of the PAT in all
+// the forms it can travel in before it leaves request() (see scrub() below).
+// Successful responses are returned untouched.
+//
+// CONFIG (invariants 7/10): org/project/apiVersion come from the consumer's
+// config/project.json `azure` block with legacy AZURE_* .env keys as fallback
+// (the existing pick() pattern). Anything missing is an explicit error naming
+// the keys looked for — never a silent fallback.
+//
+// WRITES (invariant 4): every write method takes {execute}. execute:false sends
+// NOTHING and returns the full request descriptor (method, url, redacted
+// headers, body summary) for the consolidated pre-approval screen. Nothing here
+// retries or cleans up — that discipline lives in ledger.js.
+//
+// IDS: every call that SENDS a request takes work-item, plan, suite, run and
+// test-case IDs in canonical decimal form only (requireId below), so an id can
+// never carry a path segment or query string into a request URL. Dry runs are
+// deliberately not checked: a plan names IDs that an earlier write in the same
+// plan will create, and the flows pass stand-ins for them.
+const fs = require('node:fs');
+const path = require('node:path');
+const pc = require(path.join(__dirname, '..', '..', 'project_config.js'));
+// The shared error class lives in ../errors.js (one home, O1); re-exported
+// below unchanged so existing `require('./ado.js').TrackerError` keeps working.
+const { TrackerError } = require('../errors.js');
+
+const PAT_ENV_NAMES = ['AZURE_PAT', 'AZURE_DEVOPS_EXT_PAT', 'AZURE_DEVOPS_PAT'];
+const DEFAULT_TIMEOUT_MS = 30_000; // same bound as the catalog runners
+const BATCH_CHUNK = 200;             // wit/workitemsbatch accepts at most 200 ids per call
+const REDACTED_AUTH = '<Basic ***, not printed>';
+const REDACTED = '<redacted>'; // what scrub() leaves where a PAT form was
+
+function configError(message) {
+  const e = new Error(message);
+  e.exitCode = 2;
+  return e;
+}
+
+// CI guard (invariant 4 / ci-quality-gate): CI mode performs no tracker writes of
+// any kind — the skill text says "don't offer"; this choke point guarantees
+// "cannot happen" even under drift. Every write method calls it after its
+// execute:false descriptor return, so dry-run plans and all reads are unaffected.
+// Environment-class refusal: exitCode 2, never a product failure.
+function assertCiWritesAllowed(op) {
+  if (process.env.AGENTEX_CI === '1') {
+    const e = configError(`ci-mode: tracker writes are disabled in CI (AGENTEX_CI=1) — ${op} with execute:true refused; bug filing and every other tracker write stay interactive`);
+    e.reason = 'ci-mode';
+    throw e;
+  }
+}
+
+// A canonical ID is a positive safe integer, or its plain decimal spelling: no
+// sign, no leading zero, no whitespace, no '#', no exponent or fraction.
+function isCanonicalId(id) {
+  if (typeof id === 'number') return Number.isSafeInteger(id) && id > 0;
+  return typeof id === 'string' && /^[1-9][0-9]*$/.test(id) && Number.isSafeInteger(Number(id));
+}
+
+// Called on every path that sends a request, before anything is sent: reads
+// and execute paths only — never on an execute:false descriptor, where
+// the bug flow's stand-ins ('{new-bug-id}', 'NEW', '<bugId>', ...) must keep
+// planning exactly as they always have. Exit 2: refused, nothing was sent.
+function requireId(op, label, id) {
+  if (isCanonicalId(id)) return;
+  const shown = typeof id === 'string' ? JSON.stringify(id)
+    : (id !== null && typeof id === 'object') ? 'an object' : String(id);
+  throw configError(`${op} needs a positive canonical decimal ${label} (got ${shown}) — refused before any request`);
+}
+
+// Relation targets ride inside the json-patch body as a composed URL; one given
+// by url (an attachment) is the server's own and is passed through.
+function requireRelationTargets(op, { relations, addRelations } = {}) {
+  for (const rel of relations || addRelations || []) {
+    if (!rel.url) requireId(op, 'relation target id', rel.targetId);
+  }
+}
+
+// azure block key first, legacy AZURE_* env second; empty/missing => null.
+function pick(cwd, az, key, envName) {
+  const j = az[key];
+  if (j !== undefined && j !== null && String(j).trim() !== '') return String(j).trim();
+  const v = pc.readEnvVar(cwd, envName);
+  return v === null || v === '' ? null : v;
+}
+
+// `azure.org` accepts both spellings, explicitly: a full URL is used as-is
+// (trailing slashes stripped); a bare org name becomes https://dev.azure.com/<org>.
+// No other guessing. Every request URL and dry-run descriptor is composed by
+// appending to this base, so it must be a plain one: credentials, a query
+// string or a fragment are refused at config time. The refusal never echoes
+// the value — it may hold a credential.
+function normalizeOrg(org) {
+  const trimmed = String(org).trim().replace(/\/+$/, '');
+  const base = /^https?:\/\//i.test(trimmed) ? trimmed : `https://dev.azure.com/${trimmed}`;
+  const hint = 'use the bare org name or its https://dev.azure.com/<org> (or on-prem collection) URL';
+  let parsed;
+  try { parsed = new URL(base); } catch {
+    throw configError(`azure.org is not a valid organization name or http(s) URL — ${hint}`);
+  }
+  if (parsed.username || parsed.password || /[?#]/.test(base)) {
+    throw configError(`azure.org must not carry credentials, a query string or a fragment — ${hint}`);
+  }
+  return base;
+}
+
+// Resolve the consumer's non-secret ADO settings (invariant 7). Missing
+// org/project is an explicit exit-2 error naming what was looked for (invariant 10).
+function resolveConfig(cwd) {
+  const az = pc.loadProjectConfig(cwd).azure || {};
+  const orgRaw = pick(cwd, az, 'org', 'AZURE_URL');
+  const project = pick(cwd, az, 'project', 'AZURE_PROJECT');
+  const missing = [];
+  if (!orgRaw) missing.push('azure.org (config/project.json) / AZURE_URL (.env)');
+  if (!project) missing.push('azure.project (config/project.json) / AZURE_PROJECT (.env)');
+  if (missing.length) {
+    throw configError(
+      `Azure DevOps is not fully configured — missing: ${missing.join(', ')}. ` +
+      'Fill the azure block in config/project.json (the /init-test wizard writes it).');
+  }
+  return {
+    base: normalizeOrg(orgRaw),
+    project,
+    team: pick(cwd, az, 'team', 'AZURE_TEAM'),
+    areaPath: pick(cwd, az, 'areaPath', 'AZURE_AREA_PATH'),
+    iterationPath: pick(cwd, az, 'iterationPath', 'AZURE_ITERATION_PATH'),
+    templateBugId: pick(cwd, az, 'bugTemplateId', 'AZURE_BUG_TEMPLATE_ID'),
+    assignees: (pick(cwd, az, 'assignee', 'AZURE_ASSIGNEE') || '')
+      .split(',').map((s) => s.trim()).filter(Boolean),
+    valueArea: pick(cwd, az, 'valueArea', 'AZURE_VALUE_AREA'),
+    environment: pick(cwd, az, 'environment', 'AZURE_ENVIRONMENT'),
+    bugCategory: pick(cwd, az, 'bugCategory', 'AZURE_BUG_CATEGORY'),
+    testPlanId: pick(cwd, az, 'testPlanId', 'AZURE_TEST_PLAN_ID'),
+    apiVersion: pick(cwd, az, 'apiVersion', 'AZURE_API_VERSION') || '7.1',
+  };
+}
+
+// WIQL string escaping: inside a single-quoted WIQL literal, ' doubles.
+const wiqlEsc = (s) => String(s).replace(/'/g, "''");
+
+// The read-only child relation (listChildren walks it; nothing here writes it).
+const CHILD_LINK = 'System.LinkTypes.Hierarchy-Forward';
+
+// PINNED: the current-sprint WIQL — the @CurrentIteration macro WITH the team
+// argument, '[<project>]\<team>', on the project-scoped wiql route (the macro
+// needs the TEAM name, not just the project). The work item type is the
+// caller's parameter, placed where the query has always carried it — never a
+// post-read filter and never an adapter default. listSprintStories issues it;
+// task-estimation's ADO strategy re-exports it (as currentIterationWiql) for
+// its pinned test.
+function iterationWiql(project, team, workItemType) {
+  return (
+    'SELECT [System.Id] FROM workitems' +
+    ` WHERE [System.WorkItemType]='${wiqlEsc(workItemType)}'` +
+    ` AND [System.TeamProject]='${wiqlEsc(project)}'` +
+    ` AND [System.IterationPath] = @CurrentIteration('[${wiqlEsc(project)}]\\${wiqlEsc(team)}')` +
+    ' ORDER BY [System.Id]'
+  );
+}
+
+// Bounded body summary for dry-run descriptors — big values truncated so a plan
+// stays renderable; never contains auth material.
+function summarizeValue(v) {
+  if (typeof v === 'string' && v.length > 120) return `${v.slice(0, 120)}… (${v.length} chars)`;
+  return v;
+}
+function summarizeOps(ops) {
+  return ops.map((o) => ({ ...o, value: typeof o.value === 'object' && o.value !== null ? o.value : summarizeValue(o.value) }));
+}
+
+function createAdapter({ cwd = process.cwd(), fetch: fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const cfg = resolveConfig(cwd);
+  const doFetch = fetchImpl || globalThis.fetch;
+  const projSeg = encodeURIComponent(cfg.project);
+
+  let patState = null; // { header, resolvedName, secretForms } — resolved lazily, once
+  function auth(op, url) {
+    if (!patState) {
+      let resolvedName = null; let pat = null;
+      for (const name of PAT_ENV_NAMES) {
+        const v = pc.readEnvVar(cwd, name);
+        if (v) { resolvedName = name; pat = v; break; }
+      }
+      if (!pat) {
+        throw configError(
+          `No Azure DevOps PAT found — looked for ${PAT_ENV_NAMES.join(', ')} in the environment and in .env. ` +
+          'Add AZURE_PAT to the project\'s .env (the /init-test wizard writes it).');
+      }
+      const encoded = Buffer.from(':' + pat).toString('base64');
+      patState = {
+        header: 'Basic ' + encoded,
+        resolvedName,
+        // Every spelling the PAT can take in an echoed diagnostic: the Basic
+        // header, its base64(':'+PAT) payload, the raw value, URL-encoded and
+        // JSON-escaped. Longest first, so the header goes as one piece.
+        secretForms: [...new Set(['Basic ' + encoded, encoded, pat, encodeURIComponent(pat), JSON.stringify(pat).slice(1, -1)])]
+          .sort((a, b) => b.length - a.length),
+      };
+    }
+    return patState;
+  }
+
+  // Error-path scrub — used ONLY where a TrackerError is built, never on a
+  // successful response. Before any PAT is resolved there is nothing to scrub.
+  function scrub(text) {
+    let out = String(text);
+    for (const form of (patState ? patState.secretForms : [])) out = out.replaceAll(form, REDACTED);
+    return out;
+  }
+  // Structured error bodies are scrubbed value by value (keys included), so a
+  // PAT the raw text hid behind JSON \u escapes is caught once it is parsed.
+  function scrubDeep(value) {
+    if (typeof value === 'string') return scrub(value);
+    if (Array.isArray(value)) return value.map(scrubDeep);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [scrub(k), scrubDeep(v)]));
+    }
+    return value;
+  }
+
+  function url(route, params = {}, { project = true, apiVersion = cfg.apiVersion } = {}) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) q.set(k, String(v));
+    q.set('api-version', apiVersion);
+    // URLSearchParams encodes '$expand' fine, but keep the literal $ readable:
+    const query = q.toString().replace(/%24/g, '$');
+    return `${cfg.base}${project ? '/' + projSeg : ''}/_apis/${route}?${query}`;
+  }
+
+  async function request(op, method, requestUrl, { body, contentType } = {}) {
+    const { header, resolvedName } = auth(op, requestUrl);
+    const headers = { Authorization: header, Accept: 'application/json' };
+    if (contentType) headers['Content-Type'] = contentType;
+    let res;
+    try {
+      res = await doFetch(requestUrl, {
+        method, headers, body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      const msg = e && (e.name === 'TimeoutError' || e.name === 'AbortError')
+        ? `request timed out after ${timeoutMs}ms`
+        : (e && e.message) || String(e);
+      throw new TrackerError({ op, url: scrub(requestUrl), serverMessage: scrub(msg) });
+    }
+    let text;
+    try {
+      text = await res.text();
+    } catch (e) {
+      // A body that cannot be read is an error path too: wrapped and scrubbed,
+      // never a raw stream error.
+      throw new TrackerError({
+        op, status: res.ok ? undefined : res.status, url: scrub(requestUrl),
+        serverMessage: scrub(`the response body could not be read: ${(e && e.message) || String(e)}`),
+      });
+    }
+    if (!res.ok) {
+      // A JSON body is scrubbed as parsed values and re-serialized; anything
+      // else is scrubbed as raw text.
+      let serverMessage = null; let body;
+      try {
+        const parsed = scrubDeep(JSON.parse(text));
+        serverMessage = (parsed && parsed.message) || null;
+        body = JSON.stringify(parsed);
+      } catch { body = scrub(text); }
+      const err = new TrackerError({
+        op, status: res.status, url: scrub(requestUrl), serverMessage, body: body.slice(0, 500),
+        credentialHint: res.status === 401 || res.status === 403
+          ? { tried: [...PAT_ENV_NAMES], resolved: resolvedName }
+          : undefined,
+      });
+      throw err;
+    }
+    if (!text.trim()) return null;
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
+  // Dry-run descriptor: the full request, minus anything secret, minus the send.
+  function descriptor(op, method, requestUrl, { body, contentType } = {}) {
+    return {
+      op, method, url: requestUrl,
+      headers: { authorization: REDACTED_AUTH, ...(contentType ? { 'content-type': contentType } : {}) },
+      body,
+    };
+  }
+
+  // Neutral {fields, relations|addRelations} -> ADO json-patch op array (the dialect seam).
+  function toPatchOps({ fields = {}, relations, addRelations } = {}) {
+    const ops = [];
+    for (const [ref, value] of Object.entries(fields)) {
+      ops.push({ op: 'add', path: `/fields/${ref}`, value });
+    }
+    for (const rel of relations || addRelations || []) {
+      ops.push({
+        op: 'add', path: '/relations/-',
+        value: {
+          rel: rel.rel,
+          url: rel.url || `${cfg.base}/_apis/wit/workItems/${rel.targetId}`,
+          ...(rel.attributes ? { attributes: rel.attributes } : {}),
+        },
+      });
+    }
+    return ops;
+  }
+
+  const webUrl = (id) => `${cfg.base}/${projSeg}/_workitems/edit/${id}`;
+
+  // Positive integer work-item ids, or an exit-2 refusal naming the op.
+  function intIds(ids, op) {
+    return [].concat(ids).map((id) => {
+      const n = Number(id);
+      if (!Number.isInteger(n) || n <= 0) throw configError(`${op} needs positive integer work-item ids (got ${JSON.stringify(id)})`);
+      return n;
+    });
+  }
+
+  return {
+    name: 'ado',
+    cwd,
+    config: cfg,
+    // Exposed so consumers use adapter.webUrl(id) instead of composing an
+    // ADO-shaped URL locally (the one latent provider leak in Phase-2 consumers).
+    webUrl,
+    capabilities: {
+      validateOnly: true,               // server-side dry-run of a create
+      attachments: true,                // binary upload API exists
+      testPlans: true,
+      testRuns: true,
+      relations: { parent: true, testedBy: true, attachedFile: true },
+      dialect: 'json-patch',            // work-item write body dialect ('json' for Jira)
+      query: 'wiql',                    // 'jql' for Jira
+      deleteWorkItem: 'partial',        // ADO: most types yes, Test Case no
+    },
+
+    // ── READS (free, no gating) ────────────────────────────────────────────────
+    async getWorkItem(id, { expand } = {}) {
+      requireId('getWorkItem', 'work-item id', id);
+      const u = url(`wit/workitems/${id}`, expand ? { $expand: expand === true ? 'all' : expand } : {});
+      return request('getWorkItem', 'GET', u);
+    },
+
+    async query(text) {
+      return request('query', 'POST', url('wit/wiql'), {
+        body: JSON.stringify({ query: text }), contentType: 'application/json',
+      });
+    },
+
+    // Sugar over query(); the adapter owns WIQL quoting/escaping.
+    async findByTitle(type, title) {
+      const esc = (s) => String(s).replace(/'/g, "''");
+      const wiql =
+        `SELECT [System.Id] FROM workitems WHERE [System.WorkItemType]='${esc(type)}'` +
+        ` AND [System.TeamProject]='${esc(cfg.project)}' AND [System.Title]='${esc(title)}'`;
+      const res = await this.query(wiql);
+      const rows = Array.isArray(res) ? res : (res && res.workItems) || [];
+      return rows.map((w) => w.id).filter((id) => id !== undefined && id !== null);
+    },
+
+    async listFields(workItemType) {
+      const u = url(`wit/workitemtypes/${encodeURIComponent(workItemType)}/fields`, { $expand: 'allowedValues' });
+      const res = await request('listFields', 'GET', u);
+      return (res && res.value) || [];
+    },
+
+    async listSuites(planId) {
+      requireId('listSuites', 'plan id', planId);
+      const res = await request('listSuites', 'GET', url(`testplan/Plans/${planId}/suites`));
+      return (res && res.value) || [];
+    },
+
+    async listSuiteCases(planId, suiteId) {
+      requireId('listSuiteCases', 'plan id', planId);
+      requireId('listSuiteCases', 'suite id', suiteId);
+      const res = await request('listSuiteCases', 'GET', url(`testplan/Plans/${planId}/Suites/${suiteId}/TestCase`));
+      return (res && res.value) || [];
+    },
+
+    // Per-suite point lookup on purpose — the global ?testCaseId shortcut 404s on many orgs.
+    async getPoint(planId, suiteId, testCaseId) {
+      requireId('getPoint', 'plan id', planId);
+      requireId('getPoint', 'suite id', suiteId);
+      requireId('getPoint', 'test case id', testCaseId);
+      const u = url(`testplan/Plans/${planId}/Suites/${suiteId}/TestPoint`, { testCaseId });
+      const res = await request('getPoint', 'GET', u);
+      return ((res && res.value) || [])[0] || null;
+    },
+
+    async listRunResults(runId) {
+      requireId('listRunResults', 'run id', runId);
+      const res = await request('listRunResults', 'GET', url(`test/Runs/${runId}/results`));
+      return (res && res.value) || [];
+    },
+
+    // Batch read: POST wit/workitemsbatch, chunks of BATCH_CHUNK, errorPolicy
+    // 'omit'. The service may answer in any order, so INPUT order is restored.
+    //   { items: [raw work item…], missing: [id…] }
+    async getWorkItems(ids, { fields } = {}) {
+      const wanted = intIds(ids, 'getWorkItems');
+      const byId = new Map();
+      for (let i = 0; i < wanted.length; i += BATCH_CHUNK) {
+        const chunk = wanted.slice(i, i + BATCH_CHUNK);
+        const body = { ids: chunk, ...(fields && fields.length ? { fields: [...fields] } : {}), errorPolicy: 'omit' };
+        const res = await request('getWorkItems', 'POST', url('wit/workitemsbatch'), { body: JSON.stringify(body), contentType: 'application/json' });
+        for (const wi of (res && res.value) || []) if (wi && wi.id !== undefined && wi.id !== null) byId.set(Number(wi.id), wi);
+      }
+      return {
+        items: wanted.filter((id) => byId.has(id)).map((id) => byId.get(id)),
+        missing: wanted.filter((id) => !byId.has(id)),
+      };
+    },
+
+    // The team's iterations: ONE GET {project}/{team}/_apis/work/teamsettings/iterations,
+    // unfiltered — the docs support only $timeframe=current server-side, so
+    // callers filter on the returned timeFrame. No team → exit 2, ZERO requests.
+    //   [{ id, name, path, startDate, finishDate, timeFrame }]
+    async listIterations({ team } = {}) {
+      if (!team) throw configError('No team resolved — iterations are team settings. Pass --team "<name>" or set azure.team in config/project.json.');
+      const u = `${cfg.base}/${projSeg}/${encodeURIComponent(team)}/_apis/work/teamsettings/iterations?api-version=${encodeURIComponent(cfg.apiVersion)}`;
+      const res = await request('listIterations', 'GET', u);
+      return ((res && res.value) || []).map((it) => {
+        const a = it.attributes || {};
+        return { id: it.id, name: it.name, path: it.path || null, startDate: a.startDate || null, finishDate: a.finishDate || null, timeFrame: a.timeFrame || null };
+      });
+    },
+
+    // ── NEUTRAL READS (additive, flow-free) ───────────────────────────────────
+    // Provider-neutral shapes for consumer flows: no CLI text, no flow wording,
+    // no story-type rule (the caller passes the type). Each issues exactly the
+    // requests a direct getWorkItem/query call would; transport errors
+    // propagate unwrapped (the same TrackerError object).
+
+    // NeutralStory { id, type, title, state, url, raw } — ONE request,
+    // getWorkItem(ref, {expand:'all'}). id is wi.id verbatim. TOTAL on an empty body: raw null,
+    // fields read as {} — never a throw for shape reasons.
+    async getStory(ref) {
+      const raw = await this.getWorkItem(ref, { expand: 'all' });
+      const f = (raw && raw.fields) || {};
+      const id = raw ? raw.id : ref; // wi.id verbatim; the ref only stands in for an empty body
+      return {
+        id,
+        type: f['System.WorkItemType'] || null,
+        title: f['System.Title'] || null,
+        state: f['System.State'] || null,
+        url: webUrl(id),
+        raw,
+      };
+    },
+
+    // NeutralChild[] { id, title ('' when absent), state (null when absent) } —
+    // ALL children, unfiltered, in relation order: one sequential GET (no
+    // expand) per Hierarchy-Forward relation on story.raw; relations whose URL
+    // has no trailing /<digits> are skipped. A failed child read rejects with
+    // the unwrapped error. Reads story.raw.relations as-is (a null raw throws).
+    async listChildren(story) {
+      const rels = (story.raw.relations || []).filter((r) => r.rel === CHILD_LINK);
+      const children = [];
+      for (const r of rels) {
+        const m = String(r.url || '').match(/\/(\d+)$/);
+        if (!m) continue;
+        const child = await this.getWorkItem(m[1]);
+        const f = (child && child.fields) || {};
+        children.push({ id: child ? child.id : Number(m[1]), title: f['System.Title'] || '', state: f['System.State'] || null });
+      }
+      return children;
+    },
+
+    // SprintStories — the team's current iteration, as refs. opts.storyType is
+    // REQUIRED (it is part of the query text); opts.team is the caller's.
+    //   { ok: false, condition: 'team-required', data: {} } — no team, ZERO requests
+    //   { ok: true, sprint: null, refs: [id, …] } — ONE POST wit/wiql; refs in
+    //     query order (may be empty). sprint is always null: @CurrentIteration
+    //     resolves server-side, and naming it would cost an extra request.
+    async listSprintStories({ storyType, team } = {}) {
+      if (!storyType) throw new Error('listSprintStories needs opts.storyType (the work item type that counts as a story)');
+      if (!team) return { ok: false, condition: 'team-required', data: {} };
+      const res = await this.query(iterationWiql(cfg.project, team, storyType));
+      const rows = Array.isArray(res) ? res : (res && res.workItems) || [];
+      return { ok: true, sprint: null, refs: rows.map((w) => w.id).filter((id) => id !== undefined && id !== null) };
+    },
+
+    // PastSprints — the team's last `count` past iterations, newest first.
+    //   { ok: false, condition: 'team-required', data: {} } — no team, ZERO requests
+    //   { ok: true, sprints: [{ id, name, path, finishDate }], found } — ONE GET
+    //     (listIterations), kept where timeFrame is 'past', sorted by finishDate
+    //     desc (ties: startDate desc, then name), sliced to count; found = all past.
+    async listPastSprints({ team, count } = {}) {
+      if (!team) return { ok: false, condition: 'team-required', data: {} };
+      const t = (d) => (d ? Date.parse(d) || 0 : 0);
+      const past = (await this.listIterations({ team }))
+        .filter((it) => it.timeFrame === 'past')
+        .sort((a, b) => (t(b.finishDate) - t(a.finishDate)) || (t(b.startDate) - t(a.startDate)) ||
+          (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      return {
+        ok: true,
+        found: past.length,
+        sprints: past.slice(0, count).map((it) => ({ id: it.id, name: it.name, path: it.path, finishDate: it.finishDate })),
+      };
+    },
+
+    // ChildEstimates — the stories of type opts.storyType in those sprints and
+    // ALL their children with the Original Estimate (and nothing else that
+    // carries hours). ZERO requests when sprints is empty. Typical cost: the
+    // story WIQL, the story titles (workitemsbatch), one child WIQL per 200
+    // stories, the children (workitemsbatch).
+    //   { stories: [{ id, seq, title, url }],
+    //     children: [{ id, seq, title, parentId, hours: number > 0 | null }], truncated: false }
+    async listChildEstimates({ sprints = [], storyType } = {}) {
+      const none = { stories: [], children: [], truncated: false };
+      const paths = sprints.map((sp) => sp.path).filter(Boolean);
+      if (!paths.length) return none;
+      if (!storyType) throw new Error('listChildEstimates needs opts.storyType (the work item type that counts as a story)');
+      const rowsOf = (res) => (Array.isArray(res) ? res : (res && res.workItems) || []).map((w) => w.id).filter((id) => id !== undefined && id !== null);
+      const storyIds = rowsOf(await this.query(
+        `SELECT [System.Id] FROM workitems WHERE [System.TeamProject]='${wiqlEsc(cfg.project)}'` +
+        ` AND [System.WorkItemType]='${wiqlEsc(storyType)}'` +
+        ` AND [System.IterationPath] IN (${paths.map((pth) => `'${wiqlEsc(pth)}'`).join(', ')}) ORDER BY [System.Id]`));
+      if (!storyIds.length) return none;
+      const storyItems = (await this.getWorkItems(storyIds, { fields: ['System.Id', 'System.Title'] })).items;
+      const childIds = [];
+      for (let i = 0; i < storyIds.length; i += BATCH_CHUNK) {
+        const chunk = intIds(storyIds.slice(i, i + BATCH_CHUNK), 'listChildEstimates');
+        childIds.push(...rowsOf(await this.query(
+          `SELECT [System.Id] FROM workitems WHERE [System.TeamProject]='${wiqlEsc(cfg.project)}'` +
+          ` AND [System.Parent] IN (${chunk.join(', ')}) ORDER BY [System.Id]`)));
+      }
+      const childItems = childIds.length
+        ? (await this.getWorkItems(childIds, { fields: ['System.Id', 'System.Title', 'System.Parent', 'Microsoft.VSTS.Scheduling.OriginalEstimate'] })).items
+        : [];
+      const hoursOf = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.round(v * 100) / 100 : null);
+      return {
+        stories: storyItems.map((w) => {
+          const f = w.fields || {};
+          return { id: w.id, seq: Number(w.id), title: f['System.Title'] || null, url: webUrl(w.id) };
+        }),
+        children: childItems.map((w) => {
+          const f = w.fields || {};
+          return {
+            id: w.id, seq: Number(w.id), title: f['System.Title'] || '',
+            parentId: f['System.Parent'] ?? null,
+            hours: hoursOf(f['Microsoft.VSTS.Scheduling.OriginalEstimate']),
+          };
+        }),
+        truncated: false,
+      };
+    },
+
+    // ── WRITES (each takes {execute}; execute:false returns the descriptor) ──
+    async createWorkItem(type, payload, { validateOnly = false, execute = false } = {}) {
+      const u = url(`wit/workitems/$${encodeURIComponent(type)}`, validateOnly ? { validateOnly: 'true' } : {});
+      const ops = toPatchOps(payload);
+      if (!execute) return descriptor('createWorkItem', 'POST', u, { body: summarizeOps(ops), contentType: 'application/json-patch+json' });
+      assertCiWritesAllowed('createWorkItem');
+      requireRelationTargets('createWorkItem', payload);
+      const res = await request('createWorkItem', 'POST', u, {
+        body: JSON.stringify(ops), contentType: 'application/json-patch+json',
+      });
+      const id = res && res.id;
+      return { id, url: (res && res._links && res._links.html && res._links.html.href) || (id ? webUrl(id) : null), validateOnly };
+    },
+
+    async updateWorkItem(id, payload, { execute = false } = {}) {
+      const u = url(`wit/workitems/${id}`);
+      const ops = toPatchOps(payload);
+      if (!execute) return descriptor('updateWorkItem', 'PATCH', u, { body: summarizeOps(ops), contentType: 'application/json-patch+json' });
+      assertCiWritesAllowed('updateWorkItem');
+      requireId('updateWorkItem', 'work-item id', id);
+      requireRelationTargets('updateWorkItem', payload);
+      const res = await request('updateWorkItem', 'PATCH', u, {
+        body: JSON.stringify(ops), contentType: 'application/json-patch+json',
+      });
+      return { id: (res && res.id) ?? id, rev: res && res.rev, url: webUrl(id) };
+    },
+
+    async addRelation(id, relType, targetId, { execute = false, attributes } = {}) {
+      return this.updateWorkItem(id, { addRelations: [{ rel: relType, targetId, ...(attributes ? { attributes } : {}) }] }, { execute });
+    },
+
+    // opts.bytes: the caller's already-checked buffer (create-bug.js passes
+    // what its structural check read), so the upload is exactly the validated
+    // bytes even if the file changes on disk in between. Without it the file
+    // is read here, as before.
+    async uploadAttachment(filePath, { fileName, execute = false, bytes } = {}) {
+      if (bytes !== undefined && bytes !== null && !(bytes instanceof Uint8Array)) {
+        throw configError('uploadAttachment opts.bytes must be a Buffer/Uint8Array when given');
+      }
+      const name = fileName || path.basename(filePath);
+      const u = url('wit/attachments', { fileName: name });
+      if (!execute) {
+        let size = bytes ? bytes.length : null;
+        if (size === null) { try { size = fs.statSync(filePath).size; } catch { /* descriptor only */ } }
+        return descriptor('uploadAttachment', 'POST', u, {
+          body: `<raw bytes of ${name}${size !== null ? `, ${size} bytes` : ''}>`,
+          contentType: 'application/octet-stream',
+        });
+      }
+      assertCiWritesAllowed('uploadAttachment');
+      const body = bytes || fs.readFileSync(filePath);
+      const res = await request('uploadAttachment', 'POST', u, { body, contentType: 'application/octet-stream' });
+      return { name, id: res && res.id, url: res && res.url };
+    },
+
+    // Legacy route POST .../test/Plans/{p}/suites/{s}/testcases/{ids} — the one that
+    // actually adds cases (verified live). Not PATCH testplan/suiteentry/{s} (live: HTTP
+    // 404, controller not found) and not testplan/.../TestCase with ids in the path
+    // (HTTP 200, nothing added). Idempotent: ids already in the suite are skipped. Fails
+    // closed: after the POST the suite is re-read, and any requested id still missing throws.
+    async addCaseToSuite(planId, suiteId, caseIds, { execute = false } = {}) {
+      const ids = [].concat(caseIds).map(String);
+      const casesUrl = url(`test/Plans/${planId}/suites/${suiteId}/testcases`);
+      const memberIds = async () => {
+        const res = await request('addCaseToSuite', 'GET', casesUrl);
+        return new Set(((res && res.value) || []).map((e) => String(e.testCase && e.testCase.id)));
+      };
+      if (!execute) {
+        return descriptor('addCaseToSuite', 'POST', url(`test/Plans/${planId}/suites/${suiteId}/testcases/${ids.join(',')}`));
+      }
+      assertCiWritesAllowed('addCaseToSuite');
+      requireId('addCaseToSuite', 'plan id', planId);
+      requireId('addCaseToSuite', 'suite id', suiteId);
+      for (const id of ids) requireId('addCaseToSuite', 'test case id', id);
+      const before = await memberIds();
+      const toAdd = ids.filter((id) => !before.has(id));
+      const alreadyPresent = ids.filter((id) => before.has(id));
+      if (toAdd.length) {
+        const u = url(`test/Plans/${planId}/suites/${suiteId}/testcases/${toAdd.join(',')}`);
+        await request('addCaseToSuite', 'POST', u);
+        const after = await memberIds();
+        const missing = toAdd.filter((id) => !after.has(id));
+        if (missing.length) {
+          throw new TrackerError({
+            op: 'addCaseToSuite', url: u,
+            serverMessage: `the request succeeded but test case(s) ${missing.join(', ')} are not in suite ${suiteId} on re-read`,
+          });
+        }
+      }
+      return { ids: ids.map(Number), added: toAdd.map(Number), alreadyPresent: alreadyPresent.map(Number), suiteId, planId };
+    },
+
+    async createRun(body, { execute = false } = {}) {
+      const u = url('test/runs');
+      if (!execute) return descriptor('createRun', 'POST', u, { body, contentType: 'application/json' });
+      assertCiWritesAllowed('createRun');
+      const res = await request('createRun', 'POST', u, { body: JSON.stringify(body), contentType: 'application/json' });
+      return { id: res && res.id, url: res && res.url };
+    },
+
+    async updateRunResults(runId, results, { execute = false } = {}) {
+      const u = url(`test/Runs/${runId}/results`);
+      if (!execute) return descriptor('updateRunResults', 'PATCH', u, { body: results, contentType: 'application/json' });
+      assertCiWritesAllowed('updateRunResults');
+      requireId('updateRunResults', 'run id', runId);
+      await request('updateRunResults', 'PATCH', u, { body: JSON.stringify(results), contentType: 'application/json' });
+      return { id: runId };
+    },
+
+    async updateRun(runId, body, { execute = false } = {}) {
+      const u = url(`test/runs/${runId}`);
+      if (!execute) return descriptor('updateRun', 'PATCH', u, { body, contentType: 'application/json' });
+      assertCiWritesAllowed('updateRun');
+      requireId('updateRun', 'run id', runId);
+      const res = await request('updateRun', 'PATCH', u, { body: JSON.stringify(body), contentType: 'application/json' });
+      return { id: (res && res.id) ?? runId, state: res && res.state };
+    },
+
+    // Standard work-item delete → the Recycle Bin (recoverable). Permanent
+    // destroy is STRUCTURALLY impossible here: no destroy option exists in the
+    // signature, none is ever emitted, and the id is validated to a positive
+    // integer before the URL is composed — nothing can smuggle a query string
+    // through it (the execute path additionally takes only the canonical
+    // spelling, like every other request). Backs the capability flag
+    // deleteWorkItem: 'partial' (ADO has no standard delete for test artifacts
+    // such as Test Cases).
+    async deleteWorkItem(id, { execute = false } = {}) {
+      const n = Number(id);
+      if (!Number.isInteger(n) || n <= 0) {
+        throw configError(`deleteWorkItem needs a positive integer work-item id (got ${JSON.stringify(id)})`);
+      }
+      const u = url(`wit/workitems/${n}`);
+      if (!execute) return descriptor('deleteWorkItem', 'DELETE', u);
+      assertCiWritesAllowed('deleteWorkItem');
+      requireId('deleteWorkItem', 'work-item id', id);
+      const res = await request('deleteWorkItem', 'DELETE', u);
+      return { id: (res && res.id) ?? n };
+    },
+  };
+}
+
+module.exports = { createAdapter, resolveConfig, normalizeOrg, iterationWiql, TrackerError, PAT_ENV_NAMES };
